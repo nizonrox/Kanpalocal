@@ -12,95 +12,133 @@ const kanpla = new Kanpla({
   LANGUAGE: 'da',
 });
 
-const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// ---------- cache ----------
 
 let cache = { data: null, week: null };
 
-function getWeekNumber(date) {
-  const d = new Date(date);
+function currentWeekNumber() {
+  const d = new Date();
   d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() + 4 - (d.getDay() || 7));
   const yearStart = new Date(d.getFullYear(), 0, 1);
-  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return Math.ceil(((d - yearStart) / 86_400_000 + 1) / 7);
 }
 
 function isCacheValid() {
-  return !!(cache.data && cache.week === getWeekNumber(new Date()));
+  return cache.data !== null && cache.week === currentWeekNumber();
 }
+
+async function getFrontendData(forceRefresh = false) {
+  if (!isCacheValid() || forceRefresh) {
+    console.log(forceRefresh ? 'Force refresh — fetching from Kanpla...' : 'Cache miss — fetching from Kanpla...');
+    try {
+      cache.data = await kanpla.getFrontend();
+    } catch (err) {
+      const isTokenExpired = err?.response?.data?.message?.includes('id-token-expired');
+      if (isTokenExpired) {
+        console.log('Token expired — refreshing and retrying...');
+        await kanpla.forceRefreshToken();
+        cache.data = await kanpla.getFrontend();
+      } else {
+        throw err;
+      }
+    }
+    cache.week = currentWeekNumber();
+  } else {
+    console.log('Cache hit — serving cached data');
+  }
+  return cache.data;
+}
+
+// ---------- date helpers ----------
+
+/**
+ * Convert a Unix timestamp (seconds) to a local YYYY-MM-DD string.
+ * Using local time avoids the UTC-vs-local mismatch when deriving day names later.
+ */
+function localDateString(timestampSeconds) {
+  const d = new Date(timestampSeconds * 1000);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/** Return the local YYYY-MM-DD strings for Monday–Friday of the current week. */
+function currentWeekDates() {
+  const today = new Date();
+  const dow = today.getDay(); // 0=Sun … 6=Sat
+  const diffToMonday = dow === 0 ? -6 : 1 - dow;
+
+  return Array.from({ length: 5 }, (_, i) => {
+    const d = new Date(today);
+    d.setDate(today.getDate() + diffToMonday + i);
+    return localDateString(d.getTime() / 1000); // reuse helper
+  });
+}
+
+// ---------- menu parsing ----------
+
+function parseMeals(frontendData) {
+  const mealsByDate = {};
+
+  for (const offer of Object.values(frontendData.offers ?? {})) {
+    for (const item of offer.items ?? []) {
+      for (const [ts, info] of Object.entries(item.dates ?? {})) {
+        if (!info.available || !info.menu?.name) continue;
+
+        const date = localDateString(parseInt(ts, 10));
+        if (!mealsByDate[date]) mealsByDate[date] = new Set();
+        mealsByDate[date].add(info.menu.name);
+      }
+    }
+  }
+
+  // Convert Sets to sorted arrays for deterministic output
+  return Object.fromEntries(
+    Object.entries(mealsByDate).map(([date, names]) => [date, [...names].sort()])
+  );
+}
+
+// ---------- routes ----------
+
+app.get('/', (_req, res) => {
+  res.type('text/plain').send('Canteen menu server — GET /menu');
+});
 
 app.get('/menu', async (req, res) => {
   try {
     const forceRefresh = req.query.refresh === 'true';
+    const data = await getFrontendData(forceRefresh);
+    const mealsByDate = parseMeals(data);
+    const weekDates = currentWeekDates();
 
-    if (!isCacheValid() || forceRefresh) {
-      console.log(forceRefresh ? 'Force refresh — fetching from Kanpla...' : 'Cache miss — fetching from Kanpla...');
-      try {
-        cache.data = await kanpla.getFrontend();
-      } catch (err) {
-        const isTokenExpired = err?.response?.data?.message?.includes('id-token-expired');
-        if (isTokenExpired) {
-          console.log('Token expired — refreshing and retrying...');
-          await kanpla.forceRefreshToken();
-          cache.data = await kanpla.getFrontend();
-        } else {
-          throw err;
-        }
-      }
-      cache.week = getWeekNumber(new Date());
-    } else {
-      console.log('Cache hit — serving cached data');
-    }
+    let output = '';
 
-    const mealsByDate = {};
+    for (const date of weekDates) {
+      const meals = mealsByDate[date];
+      const dayName = DAY_NAMES[new Date(`${date}T12:00:00`).getDay()]; // noon avoids DST edge cases
+      output += `\n📅 ${dayName}, ${date}\n${'-'.repeat(30)}\n`;
 
-    for (const offer of Object.values(cache.data.offers || {})) {
-      for (const item of offer.items || []) {
-        for (const [ts, info] of Object.entries(item.dates || {})) {
-          if (!info.available || !info.menu?.name) continue;
-
-          const date = new Date(parseInt(ts) * 1000).toISOString().split('T')[0];
-          if (!mealsByDate[date]) mealsByDate[date] = [];
-
-          if (!mealsByDate[date].find(m => m.name === info.menu.name)) {
-            mealsByDate[date].push({ name: info.menu.name });
-          }
+      if (!meals || meals.length === 0) {
+        output += '  (no menu available)\n';
+      } else {
+        for (const name of meals) {
+          output += `  • ${name}\n`;
         }
       }
     }
 
-const today = new Date();
-
-// Get Monday of current week
-const startOfWeek = new Date(today);
-const day = today.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-const diffToMonday = day === 0 ? -6 : 1 - day;
-startOfWeek.setDate(today.getDate() + diffToMonday);
-
-// Get Sunday of current week
-const endOfWeek = new Date(startOfWeek);
-endOfWeek.setDate(startOfWeek.getDate() + 6);
-
-const startOfWeekStr = startOfWeek.toISOString().split('T')[0];
-const endOfWeekStr = endOfWeek.toISOString().split('T')[0];
-
-let output = '';
-
-for (const date of Object.keys(mealsByDate).sort()) {
-  if (date < startOfWeekStr || date > endOfWeekStr) continue;
-
-  output += `\n📅 ${DAYS[new Date(date).getDay()]}, ${date}\n${'-'.repeat(30)}\n`;
-
-  for (const meal of mealsByDate[date]) {
-    output += `  • ${meal.name}\n`;
-  }
-}
-
-    res.type('text/plain').send(output);
+    res.type('text/plain').send(output.trim());
   } catch (err) {
-    console.error(err);
-    res.status(500).send('Failed to fetch menu');
+    console.error('Error fetching menu:', err);
+    res.status(500).type('text/plain').send('Failed to fetch menu. Check server logs.');
   }
 });
+
+// ---------- start ----------
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Running on http://localhost:${PORT}`));

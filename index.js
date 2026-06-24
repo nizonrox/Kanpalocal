@@ -98,7 +98,7 @@ function parseMeals(frontendData) {
 
   // Convert Sets to sorted arrays for deterministic output
   return Object.fromEntries(
-    Object.entries(mealsByDate).map(([date, names]) => [date, [...names].sort()])
+    Object.entries(mealsByDate).map(([date, names]) => [date, [...names].sort().reverse()])
   );
 }
 

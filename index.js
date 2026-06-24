@@ -34,7 +34,18 @@ app.get('/menu', async (req, res) => {
 
     if (!isCacheValid() || forceRefresh) {
       console.log(forceRefresh ? 'Force refresh — fetching from Kanpla...' : 'Cache miss — fetching from Kanpla...');
-      cache.data = await kanpla.getFrontend();
+      try {
+        cache.data = await kanpla.getFrontend();
+      } catch (err) {
+        const isTokenExpired = err?.response?.data?.message?.includes('id-token-expired');
+        if (isTokenExpired) {
+          console.log('Token expired — refreshing and retrying...');
+          await kanpla.forceRefreshToken();
+          cache.data = await kanpla.getFrontend();
+        } else {
+          throw err;
+        }
+      }
       cache.week = getWeekNumber(new Date());
     } else {
       console.log('Cache hit — serving cached data');
